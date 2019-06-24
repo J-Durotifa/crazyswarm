@@ -40,6 +40,7 @@
 #include <csignal> // or C++ style alternative
 
 // Motion Capture
+#include "libmotioncapture/testmocap.h"
 #ifdef ENABLE_VICON
 #include "libmotioncapture/vicon.h"
 #endif
@@ -175,8 +176,11 @@ public:
     const std::vector<crazyflie_driver::LogBlock>& log_blocks,
     ros::CallbackQueue& queue,
     bool force_no_cache)
-    : m_cf(link_uri, rosLogger)
-    , m_tf_prefix(tf_prefix)
+    : m_tf_prefix(tf_prefix)
+    , m_cf(
+      link_uri,
+      rosLogger,
+      std::bind(&CrazyflieROS::onConsole, this, std::placeholders::_1))
     , m_frame(frame)
     , m_worldFrame(worldFrame)
     , m_enableParameters(enable_parameters)
@@ -226,7 +230,7 @@ public:
   {
     m_logBlocks.clear();
     m_logBlocksGeneric.clear();
-    m_cf.trySysOff();
+    // m_cf.trySysOff();
     m_logFile.close();
   }
 
@@ -592,6 +596,17 @@ public:
       }
   }
 
+  void onConsole(const char* msg) {
+    static std::string messageBuffer;
+    messageBuffer += msg;
+    size_t pos = messageBuffer.find('\n');
+    if (pos != std::string::npos) {
+      messageBuffer[pos] = 0;
+      ROS_INFO_NAMED(m_tf_prefix, "CF Console: %s", messageBuffer.c_str());
+      messageBuffer.erase(0, pos+1);
+    }
+  }
+
   void onLogCustom(uint32_t time_in_ms, std::vector<double>* values, void* userData) {
 
     ros::Publisher* pub = reinterpret_cast<ros::Publisher*>(userData);
@@ -635,8 +650,18 @@ public:
     m_cf.setParam<uint8_t>(entry->id, 1);
 
     // kalmanUSC might not be part of the firmware
-    entry = m_cf.getParamTocEntry("kalmanUSC", "rstWithExtPos");
+    entry = m_cf.getParamTocEntry("kalmanUSC", "resetEstimation");
     if (entry) {
+      m_cf.startSetParamRequest();
+      entry = m_cf.getParamTocEntry("kalmanUSC", "initialX");
+      m_cf.addSetParam(entry->id, x);
+      entry = m_cf.getParamTocEntry("kalmanUSC", "initialY");
+      m_cf.addSetParam(entry->id, y);
+      entry = m_cf.getParamTocEntry("kalmanUSC", "initialZ");
+      m_cf.addSetParam(entry->id, z);
+      m_cf.setRequestedParams();
+
+      entry = m_cf.getParamTocEntry("kalmanUSC", "resetEstimation");
       m_cf.setParam<uint8_t>(entry->id, 1);
     }
 
@@ -644,8 +669,8 @@ public:
   }
 
 private:
-  Crazyflie m_cf;
   std::string m_tf_prefix;
+  Crazyflie m_cf;
   std::string m_frame;
   std::string m_worldFrame;
   bool m_enableParameters;
@@ -762,7 +787,10 @@ public:
 
     if (m_useMotionCaptureObjectTracking) {
       for (auto cf : m_cfs) {
-        publishRigidBody(cf->frame(), cf->id(), states);
+        bool found = publishRigidBody(cf->frame(), cf->id(), states);
+        if (found) {
+          cf->initializePositionIfNeeded(states.back().x, states.back().y, states.back().z);
+        }
       }
     } else {
       // run object tracker
@@ -868,6 +896,7 @@ public:
 
   void emergency()
   {
+    m_cfbc.emergencyStop();
     m_isEmergency = true;
   }
 
@@ -974,7 +1003,7 @@ public:
 
 private:
 
-  void publishRigidBody(const std::string& name, uint8_t id, std::vector<CrazyflieBroadcaster::externalPose> &states)
+  bool publishRigidBody(const std::string& name, uint8_t id, std::vector<CrazyflieBroadcaster::externalPose> &states)
   {
     bool found = false;
     for (const auto& rigidBody : *m_pMocapObjects) {
@@ -1004,7 +1033,7 @@ private:
         transform.setRotation(q);
         m_br.sendTransform(tf::StampedTransform(transform, ros::Time::now(), "world", name));
         found = true;
-        break;
+        return true;
       }
 
     }
@@ -1012,6 +1041,7 @@ private:
     if (!found) {
       ROS_WARN("No updated pose for motion capture object %s", name.c_str());
     }
+    return false;
   }
 
 
@@ -1060,7 +1090,8 @@ private:
         nGlobal.getParam("crazyflieTypes/" + type + "/markerConfiguration", markerConfigurationIdx);
         int dynamicsConfigurationIdx;
         nGlobal.getParam("crazyflieTypes/" + type + "/dynamicsConfiguration", dynamicsConfigurationIdx);
-        objects.push_back(libobjecttracker::Object(markerConfigurationIdx, dynamicsConfigurationIdx, m));
+        std::string name = "cf" + std::to_string(id);
+        objects.push_back(libobjecttracker::Object(markerConfigurationIdx, dynamicsConfigurationIdx, m, name));
 
         std::stringstream sstr;
         sstr << std::setfill ('0') << std::setw(2) << std::hex << id;
@@ -1186,8 +1217,14 @@ private:
             double b = value;
             nGlobal.setParam(cf->frame() + "/" + group + "/" + param, b);
             std::cout << "update " << group + "/" + param << " to " << b << std::endl;
+          } else if (value.getType() == XmlRpc::XmlRpcValue::TypeString) {
+            // "1e-5" is not recognize as double; convert manually here
+            std::string value_str = value;
+            double value = std::stod(value_str);
+            nGlobal.setParam(cf->frame() + "/" + group + "/" + param, value);
+            std::cout << "update " << group + "/" + param << " to " << value << std::endl;
           } else {
-            ROS_WARN("No known type for %s.%s!", group.c_str(), param.c_str());
+            ROS_ERROR("No known type for %s.%s! (type: %d)", group.c_str(), param.c_str(), value.getType());
           }
           request.params.push_back(group + "/" + param);
 
@@ -1372,6 +1409,20 @@ public:
     libmotioncapture::MotionCapture* mocap = nullptr;
     if (motionCaptureType == "none")
     {
+    } else if (motionCaptureType == "test")
+    {
+        std::vector<libmotioncapture::Object> objects;
+        pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud(new pcl::PointCloud<pcl::PointXYZ>);
+        pointCloud->push_back(pcl::PointXYZ(-0.5, 1.0, 0.0));
+        pointCloud->push_back(pcl::PointXYZ(-0.5, 0.5, 0.0));
+        pointCloud->push_back(pcl::PointXYZ(-0.5, 0.0, 0.0));
+        pointCloud->push_back(pcl::PointXYZ(-0.5, -0.5, 0.0));
+        pointCloud->push_back(pcl::PointXYZ(-0.5, -1.0, 0.0));
+
+        mocap = new libmotioncapture::MotionCaptureTest(
+          0.01,
+          objects,
+          pointCloud);
     }
 #ifdef ENABLE_VICON
     else if (motionCaptureType == "vicon")
@@ -1386,11 +1437,9 @@ public:
 #ifdef ENABLE_OPTITRACK
     else if (motionCaptureType == "optitrack")
     {
-      std::string localIP;
-      std::string serverIP;
-      nl.getParam("optitrack_local_ip", localIP);
-      nl.getParam("optitrack_server_ip", serverIP);
-      mocap = new libmotioncapture::MotionCaptureOptitrack(localIP, serverIP);
+      std::string hostName;
+      nl.getParam("optitrack_host_name", hostName);
+      mocap = new libmotioncapture::MotionCaptureOptitrack(hostName);
     }
 #endif
 #ifdef ENABLE_PHASESPACE
@@ -1667,8 +1716,12 @@ private:
     std_srvs::Empty::Response& res)
   {
     ROS_FATAL("Emergency requested!");
-    for (auto& group : m_groups) {
-      group->emergency();
+
+    for (size_t i = 0; i < m_broadcastingNumRepeats; ++i) {
+      for (auto& group : m_groups) {
+        group->emergency();
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(m_broadcastingDelayBetweenRepeatsMs));
     }
     m_isEmergency = true;
 
